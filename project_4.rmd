@@ -1,0 +1,335 @@
+---
+title: "Project_4"
+author: "Max Carvalho"
+date: "2024-05-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Report:
+
+● Brief Introduction: Provide background information and motivation for the paper.
+● Methods: Explain the main steps followed to reproduce the figures.
+● Figure 4A . The goal is to use a dimensionality
+reduction technique enabling to separate the parental and the resistant cells in a
+2D space. You can decide to use any other dimensionality reduction technique
+but please motivate your choice.
+● For your second task, choose one (or more, if you are motivated!) of the following
+figure to reproduce:
+  a. 4b
+  b. 4c: you are welcome to use another database than MSigDB.
+  c. S4a & S4b
+● Figures and Discussion: Analyze the obtained figures. Could you reproduce the
+figures exactly as they appear in the paper? Justify your answer.
+● Conclusion
+
+
+```{r libraries, echo =FALSE}
+if (!requireNamespace("Matrix", quietly = TRUE)) {
+    install.packages("Matrix")
+}
+
+if (!requireNamespace("Seurat", quietly = TRUE)) {
+    install.packages("Seurat")
+}
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    install.packages("ggplot2")
+}
+if (!requireNamespace("dplyr", quietly = TRUE)) {
+    install.packages("dplyr")
+}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+if (!requireNamespace("VennDiagram", quietly = TRUE)) {
+    install.packages("VennDiagram")
+}
+library(VennDiagram)
+BiocManager::install("fgsea")
+library(fgsea)
+library(tidyverse)  # for data manipulation
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(Matrix)
+
+```
+The data loaded will be the treated and untreated cells data in the form of sparse matrices and the corresponding barcodes (individual cells) as columns and the genes as rows. Row and column names are in the (U)T_genes and (U)T_barcodes, respectively. 
+
+```{r data, echo=FALSE}
+T_proliferation <- read.csv("T_cells_proliferation.csv")
+UT_proliferation <- read.csv("UT_cells_proliferation.csv")
+
+
+T_mtx <- ReadMtx(mtx="GSM5014870_T_matrix.mtx",
+                 features="GSM5014870_T_genes.tsv",
+                 cells="GSM5014870_T_barcodes.tsv")
+
+UT_mtx <- ReadMtx(mtx="GSM5014869_UT_matrix.mtx",
+                  features="GSM5014869_UT_genes.tsv",
+                  cells="GSM5014869_UT_barcodes.tsv")
+
+```
+
+Looking at the data
+```{r look at data, echo=FALSE}
+print(paste("Number of rows:", UT_mtx@Dim[1]))
+print(paste("Number of columns:", UT_mtx@Dim[2]))
+
+print(paste("Number of non-zero elements:", length(UT_mtx@x)))
+
+image(UT_mtx[1:100, 1:100])
+
+```
+
+
+```{r}
+gene_exp_sums = rowSums(UT_mtx)
+cell_exp_sums = colSums(UT_mtx)
+
+gene_plot <- ggplot(data.frame(Expression = gene_exp_sums), aes(x = Expression)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  ggtitle("Distribution of Total Expression per Gene") +
+  xlab("Total Expression") + ylab("Number of Genes")
+
+cell_plot <- ggplot(data.frame(Expression = cell_exp_sums), aes(x = Expression)) +
+  geom_histogram(bins = 50, fill = "lightgreen", color = "black") +
+  ggtitle("Distribution of Total Expression per Cell") +
+  xlab("Total Expression") + ylab("Number of Cells")
+
+print(gene_plot)
+print(cell_plot)
+
+```
+
+
+Preprocessing the data 
+
+```{r seurat prep, echo=FALSE}
+UT_seurat <- CreateSeuratObject(counts = UT_mtx, project = "UT", min.cells = 3, min.features = 200)
+T_seurat <- CreateSeuratObject(counts = T_mtx, project = "T", min.cells = 3, min.features = 200)
+```
+
+```{r}
+merged <- merge(UT_seurat, T_seurat, add.cell.ids = c("UT", "T"), project = "Melanoma")
+```
+
+
+```{r}
+combined_proliferation <- rbind(UT_proliferation, T_proliferation)
+merged <- AddMetaData(object = merged, metadata = combined_proliferation, col.name = "is_proliferative")
+
+```
+
+
+```{r}
+metadata <- merged@meta.data
+
+metadata$group <- ifelse(metadata$orig.ident=="UT" & !metadata$is_proliferative, "UT_Q",
+                  ifelse(metadata$orig.ident=="UT" & metadata$is_proliferative, "UT_P",
+                  ifelse(metadata$orig.ident=="T" & metadata$is_proliferative, "Escapees",
+                  ifelse(metadata$orig.ident=="T" & !metadata$is_proliferative, "Non_Escapees", NA))))
+
+merged@meta.data <- metadata
+```
+
+
+```{r}
+merged <- subset(merged, subset = nCount_RNA > 800 &
+         nFeature_RNA > 500)
+VlnPlot(merged, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2, pt.size = 0.1, alpha = 0.1)
+
+```
+
+
+
+Dimensionality reduction and clustering
+```{r}
+merged <- NormalizeData(object = merged,assay = "RNA", normalization.method = "LogNormalize", verbose = TRUE)
+merged <- FindVariableFeatures(object = merged)
+merged <- ScaleData(object = merged)
+merged <- RunPCA(object = merged)
+ElbowPlot(merged)
+merged <- FindNeighbors(object = merged, dims = 1:20)
+merged <- FindClusters(object = merged)
+merged <- RunTSNE(object = merged, dims = 1:20)
+
+```
+
+```{r}
+group_colors <- c("UT_Q" = "green", "UT_P" = "grey", "Escapees" = "red", "Non_Escapees" = "blue")
+
+DimPlot(merged, reduction = 'tsne', group.by = "group", cols=group_colors, )
+```
+
+
+FIGURE 2
+
+Preparing the seurat object for DGEA
+```{r}
+merged <- JoinLayers(
+  object = merged, 
+  layers.to.join = c("counts.UT", "counts.T", "data.UT", "data.T", "scale.data"), 
+  name = "joined"
+)
+
+```
+
+```{r}
+Idents(merged) <- merged@meta.data$group
+```
+
+DGEA
+```{r}
+# Differential expression analysis setup
+escapee_vs_nonescapee <- FindMarkers(merged, ident.1 = "Escapees", ident.2 = "Non_Escapees")
+escapee_vs_ut <- FindMarkers(merged, ident.1 = "Escapees", ident.2 = "UT_P")
+
+
+```
+
+
+```{r}
+EvsNE_upreg <- rownames(escapee_vs_nonescapee)[escapee_vs_nonescapee$avg_log2FC > 0 & escapee_vs_nonescapee$p_val_adj < 0.005]
+EvsUT_upreg <- rownames(escapee_vs_ut)[escapee_vs_ut$avg_log2FC > 0 & escapee_vs_ut$p_val_adj < 0.005]
+intersect_upreg <- intersect(EvsNE_upreg, EvsUT_upreg)
+```
+
+
+Making the venn diagram for the second figure
+```{r}
+
+
+list_of_genes <- list(
+  EvsNE_upreg = EvsNE_upreg,
+  EvsUT_upreg = EvsUT_upreg
+)
+fill_colors <- c(alpha("blue", 0.5), alpha("red", 0.5))
+
+venn_plot <- venn.diagram(
+  x = list_of_genes,
+  filename = "vennv2.tiff",  # Plot directly to the R plotting window
+  category.names = c("EvsNE", "EvsUT"),
+  output = TRUE,
+  height = 800,
+  width = 800,
+  resolution = 300,
+  compression = "lzw",
+  lwd = 2,
+  col = "black",
+  fill = fill_colors,
+  alpha = 0.5,
+  cat.col = c("black", "black"),  # Colors for the labels of each set
+  cat.cex = 1.5,
+  cat.fontfamily = "sans",
+  cat.fontface = "bold",
+  cat.dist = 0.05,
+  cat.pos = c(-20, 14)
+)
+
+
+```
+
+
+
+We want the top genes in the intersection of these two upregulated gene populations
+```{r}
+intersect_data <- data.frame(
+  gene = intersect_upreg,
+  log2FC_NE = escapee_vs_nonescapee[intersect_upreg, "avg_log2FC"],
+  pval_adj_NE = escapee_vs_nonescapee[intersect_upreg, "p_val_adj"],
+  log2FC_UT = escapee_vs_ut[intersect_upreg, "avg_log2FC"],
+  pval_adj_UT = escapee_vs_ut[intersect_upreg, "p_val_adj"]
+)
+
+# intersect_data_ordered <- intersect_data[order(-intersect_data$log2FC_NE, intersect_data$pval_adj_NE),]
+
+intersect_data_ordered <- intersect_data[order(intersect_data$pval_adj_NE),]
+
+head(intersect_data_ordered)
+```
+
+Top intersecting genes in the paper
+```{r}
+provided_genes <- c("CDC42EP1", "NUPR1", "MTHFD2", "PYCR1", "TRIB3", 
+                    "TPM1", "GARS", "ASNS", "PCLO", "FTH1", 
+                    "SLC1A5", "EFEMP1", "RAB32", "PHGDH", "MYL12A", 
+                    "LINC01133", "PSAT1", "SLC7A5", "DKK1", "ACTB", 
+                    "ANXA2", "SLC3A2", "AKR1B1", "TXNRD1", "FTL", 
+                    "MGST1", "UGCG", "KCNG1", "TPM4", "HEBP2", 
+                    "TUBB2A", "FLNA", "THBS1", "HMOX1", "TNFRSF12A", 
+                    "G6PD", "MT1X", "CYR61", "TMSB4X", "MARCKS")
+
+```
+
+We want to see if we also have these genes in our list as we have more.
+```{r}
+common_genes <- intersect(provided_genes, intersect_upreg)
+print(common_genes)
+
+number_of_common_genes <- length(common_genes)
+print(paste("Number of common genes:", number_of_common_genes))
+
+
+```
+
+Now comparing with just the 15 ATF4 genes provided in the paper
+```{r}
+
+ATF4_genes <- c("CDC42EP1", "NUPR1", "MTHFD2", "PYCR1", "TRIB3", 
+                    "TPM1", "GARS", "ASNS", "PCLO", "FTH1", 
+                    "SLC1A5", "EFEMP1", "RAB32", "PHGDH", "MYL12A")
+
+
+top_genes_data <- intersect_data_ordered[1:40, ]
+
+top_genes_data$Is_ATF4<- top_genes_data$gene %in% ATF4_genes
+
+write.csv(top_genes_data[c("gene", "Is_ATF4")], "Top_Genes.csv", row.names = FALSE)
+
+print(top_genes_data)
+print(length(intersect(ATF4_genes, top_genes_data$gene)))
+
+
+
+```
+```{r}
+final_list <- top_genes_data$gene
+print(final_list)
+```
+
+
+```{r}
+gene_plot <- ggplot(top_genes_data, aes(x = 1, y = gene, label = gene, color = Is_ATF4)) +
+  geom_text(aes(y = reorder(gene, Is_ATF4)), hjust = -0.2, size = 3.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  theme_minimal() +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none") +
+  labs(title = "40 intersect up-regulated genes")
+
+# Print the plot
+print(gene_plot)
+
+
+
+```
+
+
+
+
+
+
+
+
+
