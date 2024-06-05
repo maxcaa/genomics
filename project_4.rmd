@@ -48,7 +48,6 @@ if (!requireNamespace("VennDiagram", quietly = TRUE)) {
     install.packages("VennDiagram")
 }
 library(VennDiagram)
-BiocManager::install("fgsea")
 library(fgsea)
 library(tidyverse)  # for data manipulation
 
@@ -110,16 +109,113 @@ print(cell_plot)
 Preprocessing the data 
 
 ```{r seurat prep, echo=FALSE}
-UT_seurat <- CreateSeuratObject(counts = UT_mtx, project = "UT", min.cells = 3, min.features = 200)
-T_seurat <- CreateSeuratObject(counts = T_mtx, project = "T", min.cells = 3, min.features = 200)
+UT_seurat <- CreateSeuratObject(counts = UT_mtx, project = "UT", min.cells = 0.01*dim(UT_mtx)[2], min.features = 5)
+T_seurat <- CreateSeuratObject(counts = T_mtx, project = "T", min.cells = 0.01*dim(T_mtx)[2], min.features = 5)
 ```
 
+Continuing with the seurat object
 ```{r}
 merged <- merge(UT_seurat, T_seurat, add.cell.ids = c("UT", "T"), project = "Melanoma")
 ```
 
+Conducting pseudo-bulk to filter out remaining lowly expressed genes
+```{r}
+
+library(mclust)
+
+merged <- SetIdent(object = merged, value = "orig.ident")
+
+treated_cells <- WhichCells(merged, idents = "T")
+untreated_cells <- WhichCells(merged, idents = "UT")
+
+psbulk_parental <-  log2(rowSums(subset(merged, subset = orig.ident == "UT")@assays$RNA@layers$counts) + 1)
+psbulk_treated <- log2(rowSums(subset(merged, subset = orig.ident == "T")@assays$RNA@layers$counts) + 1)
+
+# counts_UT <- merged@assays$RNA@layers$counts
+# counts_T <- merged@assays$RNA@layers$counts
+# 
+# 
+# psbulk_parental <- log2(rowSums(GetAssayData(merged, layer = "counts")[, untreated_cells]) + 1)
+# psbulk_treated <- log2(rowSums(GetAssayData(merged, layer = "counts")[, treated_cells]) + 1)
+
+```
+
 
 ```{r}
+# Fit density models and determine limits for foreground/background separation
+bimdens_parental <- mclust::densityMclust(data = psbulk_parental, G = 2, plot = FALSE)
+lim_parental <- qnorm(0.9, mean = bimdens_parental$parameters$mean[1], sd = sqrt(bimdens_parental$parameters$variance$sigmasq[1]))
+
+bimdens_treated <- mclust::densityMclust(data = psbulk_treated, G = 2, plot = FALSE)
+lim_resistant <- qnorm(0.9, mean = bimdens_treated$parameters$mean[1], sd = sqrt(bimdens_treated$parameters$variance$sigmasq[1]))
+
+
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+# Plot histograms with the limits
+hist(psbulk_parental, breaks = 50, col = "lightblue", xlab = "Expression", ylab = "Frequency", main = "Untreated Expression")
+abline(v = lim_parental, col = "red", lwd = 2)
+
+hist(psbulk_treated, breaks = 50, col = "lightgreen", xlab = "Expression", ylab = "Frequency", main = "Treated Expression")
+abline(v = lim_resistant, col = "red", lwd = 2)
+
+legend("topright", legend = c("90% Background Removal"), col = "red", lty = 1, lwd = 2)
+
+```
+
+
+```{r}
+indexes_parental <- which(psbulk_parental > lim_parental)
+indexes_treated <- which(psbulk_treated > lim_resistant)
+filtered_genes <- union(indexes_parental, indexes_treated)
+
+# Subset the Seurat object to keep only the filtered genes
+filtered_merged <- subset(merged, features = rownames(merged)[filtered_genes])
+```
+
+
+```{r}
+
+psbulk_parental <-  log2(rowSums(subset(filtered_merged, subset = orig.ident == "UT")@assays$RNA@layers$counts) + 1)
+psbulk_treated <- log2(rowSums(subset(filtered_merged, subset = orig.ident == "T")@assays$RNA@layers$counts) + 1)
+
+print(paste("After filtering we have", as.character(nrow(filtered_merged)), "genes."))
+
+```
+
+
+Testing for mitochondrial genes
+```{r}
+mitest <- merged
+
+mitest <- JoinLayers(
+  object = mitest, 
+  layers.to.join = c("counts.UT", "counts.T", "data.UT", "data.T", "scale.data"), 
+  name = "joined"
+)
+counts <- mitest@assays$RNA@layers$counts
+```
+
+
+```{r}
+mt_genes <- grep("^MT-", rownames(mitest@assays$RNA@layers$counts), value = TRUE)
+
+mt_counts <- colSums(counts[mt_genes, ])
+mt_percentage <- mt_counts / colSums(counts) * 100
+
+median_mt_percentage <- median(mt_percentage)
+mad_mt_percentage <- mad(mt_percentage)
+
+
+print(median_mt_percentage)
+print(mad_mt_percentage)
+```
+Here we see that filtering out mitochondrial expression isn't necessary as it is already at 0.
+Thus we continue with the analysis.
+
+```{r}
+merged <- filtered_merged
+
 combined_proliferation <- rbind(UT_proliferation, T_proliferation)
 merged <- AddMetaData(object = merged, metadata = combined_proliferation, col.name = "is_proliferative")
 
@@ -139,9 +235,9 @@ merged@meta.data <- metadata
 
 
 ```{r}
-merged <- subset(merged, subset = nCount_RNA > 800 &
-         nFeature_RNA > 500)
-VlnPlot(merged, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2, pt.size = 0.1, alpha = 0.1)
+# merged <- subset(merged, subset = nCount_RNA > 800 &
+#          nFeature_RNA > 500)
+# VlnPlot(merged, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2, pt.size = 0.1, alpha = 0.1)
 
 ```
 
